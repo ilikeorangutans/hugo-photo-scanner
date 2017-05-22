@@ -45,7 +45,6 @@ func main() {
 			}(path)
 		}
 	}
-	log.Println("Now waiting for goroutines...")
 	wg.Wait()
 }
 
@@ -78,8 +77,6 @@ type Gallery struct {
 }
 
 func scanGallery(path string, makeRelative func(string) string) Gallery {
-	log.Printf("Reading gallery at %s\n", path)
-
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
 		log.Fatal(err)
@@ -112,10 +109,7 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 		counter++
 		go func(path string, makeRelative func(string) string) {
 			info := handleImage(path, makeRelative)
-
-			log.Printf("Writing  result for %s", path)
 			imageChannel <- info
-			log.Printf("Done with %s", path)
 		}(filepath.Join(path, f.Name()), makeRelative)
 	}
 
@@ -136,7 +130,7 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 
 const (
 	SMALL_WIDTH = 255
-	LARGE_WIDTH = 2048
+	LARGE_WIDTH = 1536
 )
 
 func loadBytes(path string) ([]byte, error) {
@@ -154,7 +148,6 @@ func loadBytes(path string) ([]byte, error) {
 }
 
 func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
-	log.Printf("Processing %s", path)
 	b, err := loadBytes(path)
 	if err != nil {
 		log.Fatal(err)
@@ -190,7 +183,29 @@ func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
 	}
 }
 
+func readInfo(name string, makeRelative func(string) string) (ImageInfo, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return ImageInfo{}, err
+	}
+	defer f.Close()
+	rawImage, _, err := image.Decode(f)
+	if err != nil {
+		return ImageInfo{}, err
+	}
+	return ImageInfo{
+		RelativeURL: makeRelative(name),
+		Width:       rawImage.Bounds().Dx(),
+		Height:      rawImage.Bounds().Dy(),
+	}, nil
+}
+
 func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative func(string) string) (ImageInfo, error) {
+	if _, err := os.Stat(name); err == nil {
+		log.Printf("Not generating %s", name)
+		return readInfo(name, makeRelative)
+	}
+
 	rawJpeg, err := jpeg.Decode(b)
 	if err != nil {
 		return ImageInfo{}, err
