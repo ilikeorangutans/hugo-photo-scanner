@@ -37,8 +37,12 @@ func main() {
 	for _, entry := range entries {
 		if entry.IsDir() {
 			path := filepath.Join(galleryRoot, entry.Name())
-			gallery := scanGallery(path, makeRelative)
-			writeGalleryToml(dataRoot, gallery)
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				gallery := scanGallery(path, makeRelative)
+				writeGalleryToml(dataRoot, gallery)
+			}(path)
 		}
 	}
 	log.Println("Now waiting for goroutines...")
@@ -81,12 +85,13 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 		log.Fatal(err)
 	}
 
-	images := []ImageMetaInfo{}
-
 	ignoreSuffixes := []string{
 		"_small.jpg",
 		"_large.jpg",
 	}
+
+	imageChannel := make(chan ImageMetaInfo)
+	counter := 0
 
 	for _, f := range files {
 		if !strings.HasSuffix(strings.ToLower(f.Name()), ".jpg") {
@@ -97,7 +102,6 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 		for _, suffix := range ignoreSuffixes {
 			if strings.HasSuffix(f.Name(), suffix) {
 				ignore = true
-				println("Ignoring", f.Name())
 				break
 			}
 		}
@@ -105,7 +109,20 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 			continue
 		}
 
-		images = append(images, handleImage(filepath.Join(path, f.Name()), makeRelative))
+		counter++
+		go func(path string, makeRelative func(string) string) {
+			info := handleImage(path, makeRelative)
+
+			log.Printf("Writing  result for %s", path)
+			imageChannel <- info
+			log.Printf("Done with %s", path)
+		}(filepath.Join(path, f.Name()), makeRelative)
+	}
+
+	images := []ImageMetaInfo{}
+	for i := 0; i < counter; i++ {
+		info := <-imageChannel
+		images = append(images, info)
 	}
 
 	gallery := Gallery{
