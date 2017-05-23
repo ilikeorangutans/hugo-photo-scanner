@@ -9,11 +9,15 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/nfnt/resize"
+	"github.com/rwcarlsen/goexif/exif"
+	"github.com/rwcarlsen/goexif/mknote"
 )
 
 func main() {
@@ -22,6 +26,8 @@ func main() {
 	staticRoot := filepath.Join(root, "static")
 	galleryRoot := filepath.Join(staticRoot, "gallery")
 	dataRoot := filepath.Join(root, "data/gallery/")
+
+	exif.RegisterParsers(mknote.All...)
 
 	entries, err := ioutil.ReadDir(galleryRoot)
 	if err != nil {
@@ -119,6 +125,8 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 		images = append(images, info)
 	}
 
+	sort.Sort(ImagesByDate(images))
+
 	gallery := Gallery{
 		Path:   path,
 		Slug:   filepath.Base(path),
@@ -127,6 +135,12 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 
 	return gallery
 }
+
+type ImagesByDate []ImageMetaInfo
+
+func (d ImagesByDate) Len() int           { return len(d) }
+func (d ImagesByDate) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
+func (d ImagesByDate) Less(i, j int) bool { return d[i].DateTime.Before(*d[j].DateTime) }
 
 const (
 	SMALL_WIDTH = 255
@@ -163,6 +177,17 @@ func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
 		Height:      rawImage.Bounds().Dy(),
 	}
 
+	x, err := exif.Decode(bytes.NewBuffer(b))
+	if err != nil {
+		log.Printf("Could not decode EXIF for %s: %s", path, err)
+	}
+
+	dt, err := x.DateTime()
+	if err != nil {
+		log.Println("no datetiem for  ", path)
+	} else {
+	}
+
 	baseName := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
 
 	smallInfo, err := resizeImage(bytes.NewBuffer(b), fmt.Sprintf("%s_small.jpg", baseName), SMALL_WIDTH, makeRelative)
@@ -176,10 +201,11 @@ func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
 	}
 
 	return ImageMetaInfo{
-		Path:  path,
-		Raw:   rawInfo,
-		Small: smallInfo,
-		Large: largeInfo,
+		Path:     path,
+		DateTime: &dt,
+		Raw:      rawInfo,
+		Small:    smallInfo,
+		Large:    largeInfo,
 	}
 }
 
@@ -232,5 +258,6 @@ type ImageInfo struct {
 
 type ImageMetaInfo struct {
 	Path              string
+	DateTime          *time.Time
 	Raw, Small, Large ImageInfo
 }
