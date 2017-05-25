@@ -21,11 +21,84 @@ import (
 )
 
 func main() {
+
+	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
+	dataRoot := filepath.Join(hugo, "data/gallery/")
+	staticRoot := filepath.Join(hugo, "static")
+	root := "/home/jakob/drobofs/photo/2017 - Mexico"
+
+	log.Printf("Scanning for albums under %s", root)
+	albumDirs, err := findAlbumDirs(root)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("Found %d album(s), processing now...", len(albumDirs))
+	log.Printf("Static files root: %s", staticRoot)
+	log.Printf("Data files root: %s", dataRoot)
+
+	config := Config{
+		StaticRoot: staticRoot,
+		DataRoot:   dataRoot,
+	}
+
+	exif.RegisterParsers(mknote.All...)
+
+	var wg sync.WaitGroup
+	for _, path := range albumDirs {
+		wg.Add(1)
+		go func() {
+			processAlbum(path, config)
+			wg.Done()
+		}()
+	}
+
+	log.Println("Waiting for processors to be done...")
+	wg.Wait()
+}
+
+func findAlbumDirs(root string) ([]string, error) {
+	albumDirs := []string{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			return nil
+		}
+		if filepath.Base(path) != "album" {
+			return nil
+		}
+
+		albumDirs = append(albumDirs, path)
+		return nil
+	})
+
+	return albumDirs, err
+}
+
+type Config struct {
+	StaticRoot string
+	DataRoot   string
+}
+
+func (c Config) MakeRelative(p string) string {
+	result, _ := filepath.Rel(c.StaticRoot, p)
+	return result
+}
+
+func processAlbum(path string, config Config) error {
+	log.Printf("Processing album %s", path)
+
+	scanGallery(path, config.MakeRelative)
+
+	return nil
+}
+
+func main2() {
 	fmt.Println("vim-go")
-	root := "/home/jakob/src/github.com/ilikeorangutans/photos"
-	staticRoot := filepath.Join(root, "static")
+	//root := "/home/jakob/drobofs/photo"
+	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
+	staticRoot := filepath.Join(hugo, "static")
 	galleryRoot := filepath.Join(staticRoot, "gallery")
-	dataRoot := filepath.Join(root, "data/gallery/")
+	dataRoot := filepath.Join(hugo, "data/gallery/")
 
 	exif.RegisterParsers(mknote.All...)
 
@@ -112,6 +185,18 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 			continue
 		}
 
+		if f.Name() == "cover.jpg" {
+
+			b, err := loadBytes(filepath.Join(path, "cover.jpg"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			resizeImage(bytes.NewBuffer(b), filepath.Join(path, "cover_small.jpg"), SMALL_WIDTH, makeRelative)
+			resizeImage(bytes.NewBuffer(b), filepath.Join(path, "cover_medium.jpg"), MEDIUM_WIDTH, makeRelative)
+
+			continue
+		}
+
 		counter++
 		go func(path string, makeRelative func(string) string) {
 			info := handleImage(path, makeRelative)
@@ -143,8 +228,9 @@ func (d ImagesByDate) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
 func (d ImagesByDate) Less(i, j int) bool { return d[i].DateTime.Before(*d[j].DateTime) }
 
 const (
-	SMALL_WIDTH = 255
-	LARGE_WIDTH = 1536
+	SMALL_WIDTH  uint = 255
+	LARGE_WIDTH       = 1536
+	MEDIUM_WIDTH      = 400
 )
 
 func loadBytes(path string) ([]byte, error) {
@@ -177,15 +263,16 @@ func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
 		Height:      rawImage.Bounds().Dy(),
 	}
 
+	var dt time.Time
 	x, err := exif.Decode(bytes.NewBuffer(b))
 	if err != nil {
 		log.Printf("Could not decode EXIF for %s: %s", path, err)
-	}
-
-	dt, err := x.DateTime()
-	if err != nil {
-		log.Println("no datetiem for  ", path)
 	} else {
+		dt, err = x.DateTime()
+		if err != nil {
+			log.Println("no datetiem for  ", path)
+		} else {
+		}
 	}
 
 	baseName := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
