@@ -20,12 +20,14 @@ import (
 	"github.com/rwcarlsen/goexif/mknote"
 )
 
+type MakeRelativeFunc func(string) string
+
 func main() {
 
 	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
-	dataRoot := filepath.Join(hugo, "data/gallery/")
+	dataRoot := filepath.Join(hugo, "data/album/")
 	staticRoot := filepath.Join(hugo, "static")
-	root := "/home/jakob/drobofs/photo/2017 - Mexico"
+	root := "/home/jakob/drobofs/photo/2015 - Philippines"
 
 	log.Printf("Scanning for albums under %s", root)
 	albumDirs, err := findAlbumDirs(root)
@@ -87,9 +89,131 @@ func (c Config) MakeRelative(p string) string {
 func processAlbum(path string, config Config) error {
 	log.Printf("Processing album %s", path)
 
-	scanGallery(path, config.MakeRelative)
+	album, err := scanAlbum2(path, config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	writeAlbumToml(config.DataRoot, album)
 
 	return nil
+}
+
+func scanAlbum2(path string, config Config) (Album, error) {
+	slug := strings.Replace(strings.ToLower(filepath.Base(filepath.Dir(path))), " ", "", -1)
+	log.Printf("Scanning album %q in %s", slug, path)
+
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		return Album{}, err
+	}
+
+	imageChannel := make(chan ImageMetaInfo)
+	counter := 0
+	for _, file := range files {
+		if ignoreFile(file) {
+			continue
+		}
+
+		counter++
+
+		widths := map[string]uint{"small": SMALL_WIDTH}
+		if file.Name() == "cover.jpg" {
+			widths["medium"] = MEDIUM_WIDTH
+			widths["large"] = LARGE_WIDTH
+		} else {
+			widths["large"] = LARGE_WIDTH
+		}
+
+		imageDestDir := filepath.Join(config.StaticRoot, "album", slug)
+		os.MkdirAll(imageDestDir, 0755)
+		go func(path string, widths map[string]uint) {
+			info, err := resizeImageTo(path, imageDestDir, config, widths)
+			if err != nil {
+				log.Fatal(err)
+			}
+			imageChannel <- info
+		}(filepath.Join(path, file.Name()), widths)
+	}
+
+	images := []ImageMetaInfo{}
+	for counter > 0 {
+		select {
+		case info := <-imageChannel:
+			images = append(images, info)
+			counter--
+		}
+	}
+	album := Album{
+		Path:   path,
+		Slug:   slug,
+		Images: images,
+	}
+
+	return album, nil
+}
+
+func resizeImageTo(src string, destDir string, config Config, widths map[string]uint) (ImageMetaInfo, error) {
+	log.Printf("Resizing image %s", src)
+
+	result := ImageMetaInfo{
+		Path: src,
+	}
+	fileName := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+	for suffix, width := range widths {
+		log.Printf("  generating %q with max width  %d", suffix, width)
+		dstFile := filepath.Join(destDir, fmt.Sprintf("%s_%s.jpg", fileName, suffix))
+
+		if _, err := os.Stat(dstFile); err == nil {
+			log.Printf("  -> not generating %s, already exists", dstFile)
+			continue
+		}
+
+		b, err := loadBytes(src)
+		if err != nil {
+			return result, err
+		}
+
+		info, err := resizeImage(bytes.NewBuffer(b), dstFile, width, config.MakeRelative)
+		if err != nil {
+			return result, err
+		}
+
+		switch suffix {
+		case "small":
+			result.Small = info
+		case "medium":
+			result.Medium = info
+		case "large":
+			result.Large = info
+		default:
+			log.Fatalf("Unknown size suffix %q", suffix)
+		}
+	}
+
+	return result, nil
+}
+
+func ignoreFile(f os.FileInfo) bool {
+	if f.IsDir() {
+		return true
+	}
+	if !strings.HasSuffix(strings.ToLower(f.Name()), ".jpg") {
+		return true
+	}
+
+	ignoreSuffixes := []string{
+		"_small.jpg",
+		"_large.jpg",
+		"_medium.jpg",
+	}
+
+	for _, suffix := range ignoreSuffixes {
+		if strings.HasSuffix(f.Name(), suffix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func main2() {
@@ -97,12 +221,12 @@ func main2() {
 	//root := "/home/jakob/drobofs/photo"
 	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
 	staticRoot := filepath.Join(hugo, "static")
-	galleryRoot := filepath.Join(staticRoot, "gallery")
-	dataRoot := filepath.Join(hugo, "data/gallery/")
+	albumRoot := filepath.Join(staticRoot, "album")
+	dataRoot := filepath.Join(hugo, "data/album/")
 
 	exif.RegisterParsers(mknote.All...)
 
-	entries, err := ioutil.ReadDir(galleryRoot)
+	entries, err := ioutil.ReadDir(albumRoot)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -115,22 +239,26 @@ func main2() {
 	var wg sync.WaitGroup
 	for _, entry := range entries {
 		if entry.IsDir() {
-			path := filepath.Join(galleryRoot, entry.Name())
+			path := filepath.Join(albumRoot, entry.Name())
 			wg.Add(1)
 			go func(path string) {
 				defer wg.Done()
-				gallery := scanGallery(path, makeRelative)
-				writeGalleryToml(dataRoot, gallery)
+				gallery := scanAlbum(path, makeRelative)
+				writeAlbumToml(dataRoot, gallery)
 			}(path)
 		}
 	}
 	wg.Wait()
 }
 
-func writeGalleryToml(root string, gallery Gallery) {
-	tomlDir := filepath.Join(root, gallery.Slug)
-	os.MkdirAll(tomlDir, 0755)
-	tomlPath := filepath.Join(tomlDir, "gallery.toml")
+func writeAlbumToml(root string, album Album) {
+	tomlDir := filepath.Join(root, album.Slug)
+	log.Printf("Writing album.toml to %s", tomlDir)
+	if err := os.MkdirAll(tomlDir, 0755); err != nil {
+		log.Fatalf("Error creating tomlDir %s", tomlDir, err)
+	}
+
+	tomlPath := filepath.Join(tomlDir, "album.toml")
 	var galleryToml *os.File
 	if _, err := os.Stat(tomlPath); os.IsNotExist(err) {
 		galleryToml, err = os.Create(tomlPath)
@@ -146,16 +274,16 @@ func writeGalleryToml(root string, gallery Gallery) {
 	defer galleryToml.Close()
 	encoder := toml.NewEncoder(galleryToml)
 
-	encoder.Encode(gallery)
+	encoder.Encode(album)
 }
 
-type Gallery struct {
+type Album struct {
 	Path   string
 	Slug   string
 	Images []ImageMetaInfo
 }
 
-func scanGallery(path string, makeRelative func(string) string) Gallery {
+func scanAlbum(path string, makeRelative MakeRelativeFunc) Album {
 	files, err := ioutil.ReadDir(path)
 	if err != nil {
 		log.Fatal(err)
@@ -164,6 +292,7 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 	ignoreSuffixes := []string{
 		"_small.jpg",
 		"_large.jpg",
+		"_medium.jpg",
 	}
 
 	imageChannel := make(chan ImageMetaInfo)
@@ -212,7 +341,7 @@ func scanGallery(path string, makeRelative func(string) string) Gallery {
 
 	sort.Sort(ImagesByDate(images))
 
-	gallery := Gallery{
+	gallery := Album{
 		Path:   path,
 		Slug:   filepath.Base(path),
 		Images: images,
@@ -344,7 +473,7 @@ type ImageInfo struct {
 }
 
 type ImageMetaInfo struct {
-	Path              string
-	DateTime          *time.Time
-	Raw, Small, Large ImageInfo
+	Path                      string
+	DateTime                  *time.Time
+	Raw, Small, Medium, Large ImageInfo
 }
