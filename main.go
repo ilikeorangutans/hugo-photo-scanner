@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -13,67 +14,124 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/nfnt/resize"
 	"github.com/rwcarlsen/goexif/exif"
 	"github.com/rwcarlsen/goexif/mknote"
+	"github.com/rwcarlsen/goexif/tiff"
+	"github.com/spf13/hugo/parser"
 )
 
 type MakeRelativeFunc func(string) string
 
 func main() {
-
 	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
 	dataRoot := filepath.Join(hugo, "data/album/")
-	staticRoot := filepath.Join(hugo, "static")
-	root := "/home/jakob/drobofs/photo/2015 - Philippines"
+	staticRoot := filepath.Join(hugo, "static/album/")
 
-	log.Printf("Scanning for albums under %s", root)
-	albumDirs, err := findAlbumDirs(root)
+	albums, err := findHugoAlbums(hugo)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	log.Printf("Found %d album(s), processing now...", len(albumDirs))
-	log.Printf("Static files root: %s", staticRoot)
-	log.Printf("Data files root: %s", dataRoot)
-
-	config := Config{
-		StaticRoot: staticRoot,
-		DataRoot:   dataRoot,
 	}
 
 	exif.RegisterParsers(mknote.All...)
 
 	var wg sync.WaitGroup
-	for _, path := range albumDirs {
+	for _, album := range albums {
 		wg.Add(1)
-		go func() {
-			processAlbum(path, config)
+		go func(album AlbumConfig) {
+			err := processHugoAlbum(album, dataRoot, staticRoot)
+			if err != nil {
+				log.Printf("Error processing album: %s", err)
+			}
 			wg.Done()
-		}()
+		}(album)
 	}
 
-	log.Println("Waiting for processors to be done...")
 	wg.Wait()
 }
 
-func findAlbumDirs(root string) ([]string, error) {
-	albumDirs := []string{}
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if !info.IsDir() {
-			return nil
+func processHugoAlbum(albumConfig AlbumConfig, dataRoot string, staticRoot string) error {
+	if _, err := os.Stat(albumConfig.SrcDir); os.IsNotExist(err) {
+		return fmt.Errorf("source dir %s for album %s not found", albumConfig.SrcDir, albumConfig.Slug)
+	}
+	dataDir := filepath.Join(dataRoot, albumConfig.Slug)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return err
+	}
+	staticDir := filepath.Join(staticRoot, albumConfig.Slug)
+	if err := os.MkdirAll(staticDir, 0755); err != nil {
+		return err
+	}
+
+	makeRelative := func(input string) string {
+		p, err := filepath.Rel(staticRoot, input)
+		if err != nil {
+			log.Fatal(err)
 		}
-		if filepath.Base(path) != "album" {
-			return nil
+		return filepath.Join("album", p)
+	}
+	album, err := scanAlbum(albumConfig, staticDir, makeRelative)
+	if err != nil {
+		return err
+	}
+	writeAlbumToml(dataRoot, album)
+	return nil
+}
+
+type AlbumConfig struct {
+	Slug   string
+	SrcDir string
+}
+
+func findHugoAlbums(path string) ([]AlbumConfig, error) {
+	contentPath := filepath.Join(path, "content", "album")
+
+	result := []AlbumConfig{}
+	entries, err := ioutil.ReadDir(contentPath)
+	if err != nil {
+		return result, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
 		}
 
-		albumDirs = append(albumDirs, path)
-		return nil
-	})
+		slug := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		log.Printf("Extracted slug %s", slug)
 
-	return albumDirs, err
+		f, err := os.Open(filepath.Join(contentPath, entry.Name()))
+		if err != nil {
+			return result, err
+		}
+		page, err := parser.ReadFrom(f)
+		if err != nil {
+			return result, err
+		}
+
+		m, err := page.Metadata()
+		if err != nil {
+			return result, err
+		}
+		x, isOk := m.(map[string]interface{})
+		if !isOk {
+			log.Fatalf("Got incorrect map value in %s", entry.Name())
+		}
+		dir, isOk := x["album"].(string)
+		if !isOk {
+			log.Printf("No album frontmatter setting in %s", entry.Name())
+			continue
+		}
+
+		albumConfig := AlbumConfig{
+			Slug:   slug,
+			SrcDir: dir,
+		}
+		result = append(result, albumConfig)
+	}
+	return result, nil
 }
 
 type Config struct {
@@ -86,23 +144,8 @@ func (c Config) MakeRelative(p string) string {
 	return result
 }
 
-func processAlbum(path string, config Config) error {
-	log.Printf("Processing album %s", path)
-
-	album, err := scanAlbum2(path, config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	writeAlbumToml(config.DataRoot, album)
-
-	return nil
-}
-
-func scanAlbum2(path string, config Config) (Album, error) {
-	slug := strings.Replace(strings.ToLower(filepath.Base(filepath.Dir(path))), " ", "", -1)
-	log.Printf("Scanning album %q in %s", slug, path)
-
-	files, err := ioutil.ReadDir(path)
+func scanAlbum(albumConfig AlbumConfig, imageDestDir string, makeRelative MakeRelativeFunc) (Album, error) {
+	files, err := ioutil.ReadDir(albumConfig.SrcDir)
 	if err != nil {
 		return Album{}, err
 	}
@@ -117,25 +160,24 @@ func scanAlbum2(path string, config Config) (Album, error) {
 		counter++
 
 		widths := map[string]uint{"small": SMALL_WIDTH}
-		if file.Name() == "cover.jpg" {
+		if strings.ToLower(file.Name()) == "cover.jpg" {
 			widths["medium"] = MEDIUM_WIDTH
 			widths["large"] = LARGE_WIDTH
 		} else {
 			widths["large"] = LARGE_WIDTH
 		}
 
-		imageDestDir := filepath.Join(config.StaticRoot, "album", slug)
 		os.MkdirAll(imageDestDir, 0755)
 		go func(path string, widths map[string]uint) {
-			info, err := resizeImageTo(path, imageDestDir, config, widths)
+			info, err := resizeImageTo(path, imageDestDir, makeRelative, widths)
 			if err != nil {
 				log.Fatal(err)
 			}
 			imageChannel <- info
-		}(filepath.Join(path, file.Name()), widths)
+		}(filepath.Join(albumConfig.SrcDir, file.Name()), widths)
 	}
 
-	images := []ImageMetaInfo{}
+	images := ImagesByDate{}
 	for counter > 0 {
 		select {
 		case info := <-imageChannel:
@@ -143,39 +185,63 @@ func scanAlbum2(path string, config Config) (Album, error) {
 			counter--
 		}
 	}
+
+	sort.Sort(images)
 	album := Album{
-		Path:   path,
-		Slug:   slug,
+		Path:   albumConfig.SrcDir,
+		Slug:   albumConfig.Slug,
 		Images: images,
 	}
 
 	return album, nil
 }
 
-func resizeImageTo(src string, destDir string, config Config, widths map[string]uint) (ImageMetaInfo, error) {
-	log.Printf("Resizing image %s", src)
+const (
+	exifTimeLayout = "2006:01:02 15:04:05"
+)
 
+func resizeImageTo(src string, destDir string, makeRelative MakeRelativeFunc, widths map[string]uint) (ImageMetaInfo, error) {
 	result := ImageMetaInfo{
 		Path: src,
 	}
 	fileName := strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
+
+	b, err := loadBytes(src)
+	if err != nil {
+		return result, err
+	}
+
+	var metadata map[string]interface{}
+	if metadata, err = extractEXIF(bytes.NewBuffer(b)); err != nil {
+		log.Printf("Error reading exif from %s: %s", src, err)
+	}
+	result.Exif = metadata
+	dateStr := strings.TrimRight(fmt.Sprintf("%s", metadata["DateTime"]), "\x00")
+	// TODO(bradfitz,mpl): look for timezone offset, GPS time, etc.
+	// For now, just always return the time.Local timezone.
+	dateTime, err := time.ParseInLocation(exifTimeLayout, dateStr, time.Local)
+	if err == nil {
+		result.DateTime = &dateTime
+	}
+
 	for suffix, width := range widths {
-		log.Printf("  generating %q with max width  %d", suffix, width)
 		dstFile := filepath.Join(destDir, fmt.Sprintf("%s_%s.jpg", fileName, suffix))
 
+		var info ImageInfo
 		if _, err := os.Stat(dstFile); err == nil {
-			log.Printf("  -> not generating %s, already exists", dstFile)
-			continue
-		}
-
-		b, err := loadBytes(src)
-		if err != nil {
-			return result, err
-		}
-
-		info, err := resizeImage(bytes.NewBuffer(b), dstFile, width, config.MakeRelative)
-		if err != nil {
-			return result, err
+			b, err := ioutil.ReadFile(dstFile)
+			if err != nil {
+				return result, err
+			}
+			info, err = extractImageInfo(b, makeRelative(dstFile))
+			if err != nil {
+				return result, err
+			}
+		} else {
+			info, err = resizeImage(bytes.NewBuffer(b), dstFile, width, makeRelative)
+			if err != nil {
+				return result, err
+			}
 		}
 
 		switch suffix {
@@ -191,6 +257,19 @@ func resizeImageTo(src string, destDir string, config Config, widths map[string]
 	}
 
 	return result, nil
+}
+
+func extractImageInfo(b []byte, relativePath string) (ImageInfo, error) {
+	c, _, err := image.DecodeConfig(bytes.NewBuffer(b))
+	if err != nil {
+		return ImageInfo{}, err
+	}
+
+	return ImageInfo{
+		RelativeURL: relativePath,
+		Width:       c.Width,
+		Height:      c.Height,
+	}, nil
 }
 
 func ignoreFile(f os.FileInfo) bool {
@@ -216,44 +295,9 @@ func ignoreFile(f os.FileInfo) bool {
 	return false
 }
 
-func main2() {
-	fmt.Println("vim-go")
-	//root := "/home/jakob/drobofs/photo"
-	hugo := "/home/jakob/src/github.com/ilikeorangutans/photos"
-	staticRoot := filepath.Join(hugo, "static")
-	albumRoot := filepath.Join(staticRoot, "album")
-	dataRoot := filepath.Join(hugo, "data/album/")
-
-	exif.RegisterParsers(mknote.All...)
-
-	entries, err := ioutil.ReadDir(albumRoot)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	makeRelative := func(s string) string {
-		p, _ := filepath.Rel(staticRoot, s)
-		return p
-	}
-
-	var wg sync.WaitGroup
-	for _, entry := range entries {
-		if entry.IsDir() {
-			path := filepath.Join(albumRoot, entry.Name())
-			wg.Add(1)
-			go func(path string) {
-				defer wg.Done()
-				gallery := scanAlbum(path, makeRelative)
-				writeAlbumToml(dataRoot, gallery)
-			}(path)
-		}
-	}
-	wg.Wait()
-}
-
 func writeAlbumToml(root string, album Album) {
+	log.Printf("Writing gallery.toml for %s", album.Slug)
 	tomlDir := filepath.Join(root, album.Slug)
-	log.Printf("Writing album.toml to %s", tomlDir)
 	if err := os.MkdirAll(tomlDir, 0755); err != nil {
 		log.Fatalf("Error creating tomlDir %s", tomlDir, err)
 	}
@@ -274,7 +318,10 @@ func writeAlbumToml(root string, album Album) {
 	defer galleryToml.Close()
 	encoder := toml.NewEncoder(galleryToml)
 
-	encoder.Encode(album)
+	err := encoder.Encode(album)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 type Album struct {
@@ -283,78 +330,19 @@ type Album struct {
 	Images []ImageMetaInfo
 }
 
-func scanAlbum(path string, makeRelative MakeRelativeFunc) Album {
-	files, err := ioutil.ReadDir(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	ignoreSuffixes := []string{
-		"_small.jpg",
-		"_large.jpg",
-		"_medium.jpg",
-	}
-
-	imageChannel := make(chan ImageMetaInfo)
-	counter := 0
-
-	for _, f := range files {
-		if !strings.HasSuffix(strings.ToLower(f.Name()), ".jpg") {
-			continue
-		}
-
-		ignore := false
-		for _, suffix := range ignoreSuffixes {
-			if strings.HasSuffix(f.Name(), suffix) {
-				ignore = true
-				break
-			}
-		}
-		if ignore {
-			continue
-		}
-
-		if f.Name() == "cover.jpg" {
-
-			b, err := loadBytes(filepath.Join(path, "cover.jpg"))
-			if err != nil {
-				log.Fatal(err)
-			}
-			resizeImage(bytes.NewBuffer(b), filepath.Join(path, "cover_small.jpg"), SMALL_WIDTH, makeRelative)
-			resizeImage(bytes.NewBuffer(b), filepath.Join(path, "cover_medium.jpg"), MEDIUM_WIDTH, makeRelative)
-
-			continue
-		}
-
-		counter++
-		go func(path string, makeRelative func(string) string) {
-			info := handleImage(path, makeRelative)
-			imageChannel <- info
-		}(filepath.Join(path, f.Name()), makeRelative)
-	}
-
-	images := []ImageMetaInfo{}
-	for i := 0; i < counter; i++ {
-		info := <-imageChannel
-		images = append(images, info)
-	}
-
-	sort.Sort(ImagesByDate(images))
-
-	gallery := Album{
-		Path:   path,
-		Slug:   filepath.Base(path),
-		Images: images,
-	}
-
-	return gallery
-}
-
 type ImagesByDate []ImageMetaInfo
 
-func (d ImagesByDate) Len() int           { return len(d) }
-func (d ImagesByDate) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
-func (d ImagesByDate) Less(i, j int) bool { return d[i].DateTime.Before(*d[j].DateTime) }
+func (d ImagesByDate) Len() int      { return len(d) }
+func (d ImagesByDate) Swap(i, j int) { d[i], d[j] = d[j], d[i] }
+func (d ImagesByDate) Less(i, j int) bool {
+	if d[i].DateTime == nil {
+		return false
+	}
+	if d[j].DateTime == nil {
+		return true
+	}
+	return d[i].DateTime.Before(*d[j].DateTime)
+}
 
 const (
 	SMALL_WIDTH  uint = 255
@@ -376,78 +364,7 @@ func loadBytes(path string) ([]byte, error) {
 	return b, nil
 }
 
-func handleImage(path string, makeRelative func(string) string) ImageMetaInfo {
-	b, err := loadBytes(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	rawImage, _, err := image.Decode(bytes.NewBuffer(b))
-	if err != nil {
-		log.Fatal(err)
-	}
-	rawInfo := ImageInfo{
-		RelativeURL: makeRelative(path),
-		Width:       rawImage.Bounds().Dx(),
-		Height:      rawImage.Bounds().Dy(),
-	}
-
-	var dt time.Time
-	x, err := exif.Decode(bytes.NewBuffer(b))
-	if err != nil {
-		log.Printf("Could not decode EXIF for %s: %s", path, err)
-	} else {
-		dt, err = x.DateTime()
-		if err != nil {
-			log.Println("no datetiem for  ", path)
-		} else {
-		}
-	}
-
-	baseName := filepath.Join(filepath.Dir(path), strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
-
-	smallInfo, err := resizeImage(bytes.NewBuffer(b), fmt.Sprintf("%s_small.jpg", baseName), SMALL_WIDTH, makeRelative)
-	if err != nil {
-		log.Println(err)
-	}
-
-	largeInfo, err := resizeImage(bytes.NewBuffer(b), fmt.Sprintf("%s_large.jpg", baseName), LARGE_WIDTH, makeRelative)
-	if err != nil {
-		log.Println(err)
-	}
-
-	return ImageMetaInfo{
-		Path:     path,
-		DateTime: &dt,
-		Raw:      rawInfo,
-		Small:    smallInfo,
-		Large:    largeInfo,
-	}
-}
-
-func readInfo(name string, makeRelative func(string) string) (ImageInfo, error) {
-	f, err := os.Open(name)
-	if err != nil {
-		return ImageInfo{}, err
-	}
-	defer f.Close()
-	rawImage, _, err := image.Decode(f)
-	if err != nil {
-		return ImageInfo{}, err
-	}
-	return ImageInfo{
-		RelativeURL: makeRelative(name),
-		Width:       rawImage.Bounds().Dx(),
-		Height:      rawImage.Bounds().Dy(),
-	}, nil
-}
-
-func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative func(string) string) (ImageInfo, error) {
-	if _, err := os.Stat(name); err == nil {
-		log.Printf("Not generating %s", name)
-		return readInfo(name, makeRelative)
-	}
-
+func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative MakeRelativeFunc) (ImageInfo, error) {
 	rawJpeg, err := jpeg.Decode(b)
 	if err != nil {
 		return ImageInfo{}, err
@@ -455,7 +372,7 @@ func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative func(
 	resized := resize.Resize(maxWidth, 0, rawJpeg, resize.Lanczos3)
 	output, err := os.Create(name)
 	defer output.Close()
-	if err := jpeg.Encode(output, resized, nil); err != nil {
+	if err := jpeg.Encode(output, resized, &jpeg.Options{Quality: 95}); err != nil {
 		return ImageInfo{}, err
 	}
 	info := ImageInfo{
@@ -467,6 +384,57 @@ func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative func(
 	return info, nil
 }
 
+func extractEXIF(r io.Reader) (map[string]interface{}, error) {
+	x, err := exif.Decode(r)
+	if err != nil {
+		return nil, err
+	}
+	x.DateTime()
+
+	walker := exifWalker{tags: make(map[string]interface{})}
+	err = x.Walk(walker)
+	if err != nil {
+		return nil, err
+	}
+	return walker.tags, nil
+}
+
+type exifWalker struct {
+	tags map[string]interface{}
+}
+
+func (w exifWalker) Walk(name exif.FieldName, tag *tiff.Tag) error {
+	var val interface{}
+	var err error
+	switch tag.Format() {
+	case tiff.StringVal:
+		str, err := tag.StringVal()
+		if err != nil {
+			log.Println(err)
+		}
+		if strings.Contains(str, "\000") {
+			str = ""
+		}
+		if utf8.ValidString(str) {
+			val = str
+		}
+	case tiff.IntVal:
+		val, err = tag.Int(0)
+		if err != nil {
+			log.Println(err)
+		}
+	case tiff.FloatVal:
+		val, err = tag.Float(0)
+		if err != nil {
+			log.Println(err)
+		}
+	case tiff.OtherVal:
+		log.Printf("OtherVal: %s", name)
+	}
+	w.tags[string(name)] = val
+	return nil
+}
+
 type ImageInfo struct {
 	RelativeURL   string
 	Width, Height int
@@ -476,4 +444,5 @@ type ImageMetaInfo struct {
 	Path                      string
 	DateTime                  *time.Time
 	Raw, Small, Medium, Large ImageInfo
+	Exif                      map[string]interface{}
 }
