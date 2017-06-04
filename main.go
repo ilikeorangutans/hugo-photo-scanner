@@ -200,6 +200,23 @@ const (
 	exifTimeLayout = "2006:01:02 15:04:05"
 )
 
+func extractDateTime(metadata map[string]interface{}) *time.Time {
+	key := "DateTime"
+	if _, isOk := metadata[key]; !isOk {
+		key = "DateTimeOriginal"
+	}
+
+	dateStr := strings.TrimRight(fmt.Sprintf("%s", metadata[key]), "\x00")
+	// TODO(bradfitz,mpl): look for timezone offset, GPS time, etc.
+	// For now, just always return the time.Local timezone.
+	dateTime, err := time.ParseInLocation(exifTimeLayout, dateStr, time.Local)
+	if err == nil {
+		return &dateTime
+	}
+
+	return nil
+}
+
 func resizeImageTo(src string, destDir string, makeRelative MakeRelativeFunc, widths map[string]uint) (ImageMetaInfo, error) {
 	result := ImageMetaInfo{
 		Path: src,
@@ -215,13 +232,21 @@ func resizeImageTo(src string, destDir string, makeRelative MakeRelativeFunc, wi
 	if metadata, err = extractEXIF(bytes.NewBuffer(b)); err != nil {
 		log.Printf("Error reading exif from %s: %s", src, err)
 	}
+
 	result.Exif = metadata
-	dateStr := strings.TrimRight(fmt.Sprintf("%s", metadata["DateTime"]), "\x00")
-	// TODO(bradfitz,mpl): look for timezone offset, GPS time, etc.
-	// For now, just always return the time.Local timezone.
-	dateTime, err := time.ParseInLocation(exifTimeLayout, dateStr, time.Local)
-	if err == nil {
-		result.DateTime = &dateTime
+	result.DateTime = extractDateTime(metadata)
+
+	orientation, has := metadata["Orientation"]
+	rotate := 0
+	if has {
+		switch orientation {
+		case 3:
+			rotate = 180
+		case 6:
+			rotate = 90
+		case 8:
+			rotate = -90
+		}
 	}
 
 	for suffix, width := range widths {
@@ -238,7 +263,7 @@ func resizeImageTo(src string, destDir string, makeRelative MakeRelativeFunc, wi
 				return result, err
 			}
 		} else {
-			info, err = resizeImage(bytes.NewBuffer(b), dstFile, width, makeRelative)
+			info, err = resizeImage(bytes.NewBuffer(b), dstFile, width, rotate, makeRelative)
 			if err != nil {
 				return result, err
 			}
@@ -345,10 +370,16 @@ func (d ImagesByDate) Less(i, j int) bool {
 }
 
 const (
-	SMALL_WIDTH  uint = 255
+	SMALL_WIDTH  uint = 600
 	LARGE_WIDTH       = 1536
-	MEDIUM_WIDTH      = 400
+	MEDIUM_WIDTH      = 800
 )
+
+var ENCODING_QUALITY map[uint]int = map[uint]int{
+	SMALL_WIDTH:  80,
+	MEDIUM_WIDTH: 80,
+	LARGE_WIDTH:  80,
+}
 
 func loadBytes(path string) ([]byte, error) {
 	imageFile, err := os.Open(path)
@@ -364,24 +395,55 @@ func loadBytes(path string) ([]byte, error) {
 	return b, nil
 }
 
-func resizeImage(b *bytes.Buffer, name string, maxWidth uint, makeRelative MakeRelativeFunc) (ImageInfo, error) {
+func resizeImage(b *bytes.Buffer, name string, maxWidth uint, angle int, makeRelative MakeRelativeFunc) (ImageInfo, error) {
 	rawJpeg, err := jpeg.Decode(b)
 	if err != nil {
 		return ImageInfo{}, err
 	}
 	resized := resize.Resize(maxWidth, 0, rawJpeg, resize.Lanczos3)
+	width, height := resized.Bounds().Dx(), resized.Bounds().Dy()
+	if angle == 90 || angle == -90 {
+		log.Printf("Rotating %s by %d", name, rotate)
+		width, height = height, width
+		resized = rotate(resized, angle)
+	}
 	output, err := os.Create(name)
 	defer output.Close()
-	if err := jpeg.Encode(output, resized, &jpeg.Options{Quality: 95}); err != nil {
+	quality := ENCODING_QUALITY[maxWidth]
+	log.Printf("Encoding %s with quality %d", name, quality)
+	if err := jpeg.Encode(output, resized, &jpeg.Options{Quality: quality}); err != nil {
 		return ImageInfo{}, err
 	}
 	info := ImageInfo{
 		RelativeURL: makeRelative(name),
-		Width:       resized.Bounds().Dx(),
-		Height:      resized.Bounds().Dy(),
+		Width:       width,
+		Height:      height,
 	}
 
 	return info, nil
+}
+
+func rotate(img image.Image, angle int) image.Image {
+	var result *image.NRGBA
+	switch angle {
+	case -90:
+		h, w := img.Bounds().Dx(), img.Bounds().Dy()
+		result = image.NewNRGBA(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				result.Set(x, y, img.At(h-1-y, x))
+			}
+		}
+	case 90:
+		h, w := img.Bounds().Dx(), img.Bounds().Dy()
+		result = image.NewNRGBA(image.Rect(0, 0, w, h))
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				result.Set(x, y, img.At(y, w-1-x))
+			}
+		}
+	}
+	return result
 }
 
 func extractEXIF(r io.Reader) (map[string]interface{}, error) {
